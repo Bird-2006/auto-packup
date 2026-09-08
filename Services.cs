@@ -36,6 +36,7 @@ public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider
     private DateTimeOffset? _started, _nextRun;
     private string? _lastError;
     private long _files;
+    private bool _previousShutdownWasClean = true;
 
     public BackupStatus GetStatus()
     {
@@ -58,14 +59,17 @@ public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider
     public async Task RunLoopAsync(CancellationToken ct)
     {
         var previous = ReadMarker();
+        _previousShutdownWasClean = previous.CleanShutdown;
         WriteMarker(new RuntimeMarker(false, previous.RecoveryCandidateId, previous.RecoveryCandidateUntil));
-        await ReconcileAsync(ct, startup: true);
+        try { await ReconcileAsync(ct, startup: true); }
+        catch (Exception ex) { logs.Error("Startup snapshot reconciliation failed", ex); lock (_gate) _lastError = ex.Message; }
         if (!previous.CleanShutdown)
         {
             lock (_gate) _queued = true;
             logs.Info("Previous service shutdown was unclean; creating a recovery snapshot immediately.");
         }
-        await TrimAsync(ct);
+        try { await TrimAsync(ct); }
+        catch (Exception ex) { logs.Error("Startup retention cleanup failed", ex); lock (_gate) _lastError = ex.Message; }
         while (!ct.IsCancellationRequested)
         {
             try
@@ -103,6 +107,13 @@ public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider
     {
         try { Directory.CreateDirectory(paths.DataDirectory); File.WriteAllText(paths.RuntimeMarkerPath, JsonSerializer.Serialize(marker)); }
         catch (Exception ex) { logs.Error("Could not update runtime marker", ex); }
+    }
+
+    public async Task<RecoveryInfo> GetRecoveryInfoAsync(CancellationToken ct)
+    {
+        var snapshot = (await repo.ListRunsAsync(ct)).FirstOrDefault(x => x.Kind == "Vss" && x.Status == "Succeeded");
+        var message = snapshot == null ? "No usable VSS snapshot is available." : $"Snapshot #{snapshot.Id} is the latest recovery point.";
+        return new RecoveryInfo(snapshot, _previousShutdownWasClean, message);
     }
 
     public async Task RunOnceAsync(CancellationToken ct)
@@ -286,6 +297,52 @@ public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider
         finally
         {
             if (temp != null) try { Directory.Delete(temp, true); } catch (Exception ex) { logs.Error("Restore temporary directory cleanup failed", ex); }
+            lock (_gate) { _operation = null; _started = null; _currentCancel = null; }
+            _runLock.Release();
+        }
+    }
+
+    public async Task<RestoreResult> ReplaceOriginalAsync(long id, string relative, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(relative)) return new(false, "Select a single database file to replace.");
+        if (!await _runLock.WaitAsync(0, ct)) return new(false, "Another operation is active.");
+        string? movedOriginal = null;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        lock (_gate) { _operation = "Replace"; _started = DateTimeOffset.UtcNow; _currentCancel = linked; _files = 0; }
+        try
+        {
+            await ReconcileCoreAsync(linked.Token, false);
+            var run = await repo.GetRunAsync(id, linked.Token);
+            if (run == null || run.Kind != "Vss" || run.Status != "Succeeded" || run.SourceDirectory == null) return new(false, "VSS snapshot is unavailable.");
+            var sourceRoot = PathRules.Resolve(run.SnapshotPath, relative);
+            if (!File.Exists(sourceRoot)) return new(false, "The selected snapshot item is not a file.");
+            var target = PathRules.Resolve(run.SourceDirectory, relative);
+            if (!File.Exists(target)) return new(false, "The original file no longer exists.");
+            PathRules.RejectLinks(target);
+            var stamp = DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            movedOriginal = target + $".before-recovery-{stamp}";
+            File.Move(target, movedOriginal);
+            foreach (var suffix in new[] { "-wal", "-shm", "-journal" })
+            {
+                var sidecar = target + suffix;
+                if (File.Exists(sidecar)) File.Move(sidecar, sidecar + $".before-recovery-{stamp}");
+            }
+            try
+            {
+                File.Copy(sourceRoot, target, false);
+            }
+            catch
+            {
+                if (!File.Exists(target) && File.Exists(movedOriginal)) File.Move(movedOriginal, target);
+                throw;
+            }
+            Interlocked.Increment(ref _files);
+            logs.Info($"Replaced original file from snapshot {id}: {target}.");
+            return new(true, $"Original file replaced. Previous file: {movedOriginal}", 1);
+        }
+        catch (Exception ex) { logs.Error("Original file replacement failed", ex); return new(false, ex.Message, _files); }
+        finally
+        {
             lock (_gate) { _operation = null; _started = null; _currentCancel = null; }
             _runLock.Release();
         }

@@ -32,6 +32,7 @@ app.MapPut("/api/config", async (BackupConfigUpdate update, BackupRepository rep
     return Results.Ok(config);
 });
 app.MapGet("/api/status", (BackupService service) => Results.Ok(service.GetStatus()));
+app.MapGet("/api/recovery", async (BackupService service, CancellationToken ct) => Results.Ok(await service.GetRecoveryInfoAsync(ct)));
 app.MapGet("/api/storage", async (IVolumeSnapshotProvider provider, CancellationToken ct) => Results.Ok(await provider.StorageAsync(ct)));
 app.MapPost("/api/backups/run", async (BackupService service, CancellationToken ct) =>
 {
@@ -55,6 +56,12 @@ app.MapGet("/api/backups/{id:long}/files", async (long id, string? path, BackupR
 app.MapPost("/api/backups/{id:long}/restore", async (long id, RestoreRequest request, BackupService service, CancellationToken ct) =>
 {
     if (string.IsNullOrWhiteSpace(request.Destination)) return Results.BadRequest(new { error = "Destination is required." });
+    if (request.ReplaceOriginal)
+    {
+        if (!request.DatabaseStopped) return Results.BadRequest(new { error = "Confirm that the database service is stopped before replacing the original file." });
+        var replaceResult = await service.ReplaceOriginalAsync(id, request.Path ?? string.Empty, ct);
+        return replaceResult.Success ? Results.Ok(replaceResult) : Results.BadRequest(replaceResult);
+    }
     var result = await service.RestoreAsync(id, request.Destination, request.Path ?? string.Empty, ct);
     return result.Success ? Results.Ok(result) : Results.BadRequest(result);
 });

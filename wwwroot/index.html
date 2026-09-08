@@ -3,7 +3,7 @@
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Auto Packup</title><link rel="stylesheet" href="/app.css"></head>
 <body><main>
   <header><div><h1>Auto Packup</h1><span id="state">连接中</span></div><div><button id="run">立即创建快照</button><button id="cancel" class="secondary" disabled>取消任务</button></div></header>
-  <p id="error" role="alert" hidden></p><p id="notice" role="status"></p>
+  <p id="error" role="alert" hidden></p><p id="notice" role="status"></p><p id="recovery" role="status"></p>
   <section class="summary"><div><span>下次创建</span><strong id="next">--</strong></div><div><span>当前耗时</span><strong id="elapsed">--</strong></div><div><span>恢复文件数</span><strong id="processed">--</strong></div><div><span>保留数量</span><strong>3 个 VSS 快照</strong></div></section>
   <section><h2>卷存储</h2><p class="muted">差异区由整个卷共享；本机快照依赖源磁盘，无法抵御源盘损坏。</p><div id="storage"></div></section>
   <section><h2>备份设置</h2><form id="config"><div class="settings"><label>源目录<input id="source" required></label><label>间隔（分钟）<input id="interval" type="number" min="1" max="1440" required></label><button type="submit">保存设置</button></div></form></section>

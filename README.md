@@ -6,6 +6,8 @@ The default schedule is every 30 minutes. Each new backup is a persistent, crash
 
 The Web management page listens on `http://127.0.0.1:5087` and supports configuration, manual snapshots, VSS storage reporting, snapshot browsing, restore to a new directory, deletion, and logs. Existing ZIP and directory backups remain readable as legacy archives.
 
+After an unexpected shutdown, the service marks the previous shutdown and creates a recovery snapshot immediately after restart. Select the last successful VSS snapshot, browse to the damaged database file, stop the database service, and use `Replace original file`. The previous file and SQLite sidecars are renamed with a `.before-recovery-*` suffix before replacement. This operation is intentionally limited to one file and requires explicit confirmation that its database service is stopped.
+
 ## Build and run
 
 Install the .NET 8 SDK, then run as an administrator:

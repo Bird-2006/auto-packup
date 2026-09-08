@@ -61,7 +61,7 @@ async function openBrowser(id, path) {
     $('file-list').replaceChildren(...entries.map(entry => {
       const row = document.createElement('div'); row.className = 'file-row';
       if (entry.isDirectory) { const name = button(entry.name + '/', () => openBrowser(id, entry.relativePath)); name.className = 'name'; row.append(name); }
-      else { const name = document.createElement('span'); name.textContent = entry.name; row.append(name); }
+      else { const name = document.createElement('span'); name.textContent = entry.name; row.append(name); row.append(button('替换原文件', () => replaceOriginal(id, entry.relativePath))); }
       row.append(button('恢复此项', () => openRestore(id, entry.relativePath)));
       return row;
     }));
@@ -72,6 +72,14 @@ function openRestore(id, path) {
   restoreId = id; restorePath = path; $('restore-source').textContent = '快照 #' + id + '：' + (path || '全部文件');
   $('restore-error').textContent = ''; $('destination').value = '';
   $('restore-dialog').showModal();
+}
+async function replaceOriginal(id, path) {
+  if (!confirm('请先停止使用此数据库的服务。确认后当前原文件会被改名保留，再从快照替换。继续？')) return;
+  try {
+    const result = await api('/api/backups/' + id + '/restore', json('POST', { destination: '', path, replaceOriginal: true, databaseStopped: true }));
+    if (!result.success) throw new Error(result.message);
+    $('notice').textContent = result.message; await refresh();
+  } catch (e) { showError(e); }
 }
 $('restore-form').onsubmit = async event => {
   event.preventDefault(); const submit = event.submitter; submit.disabled = true;
@@ -91,7 +99,11 @@ $('config').onsubmit = async event => {
   try { config = await api('/api/config', json('PUT', { ...config, sourceDirectory: $('source').value, intervalMinutes: Number($('interval').value) })); $('notice').textContent = '设置已保存'; $('error').hidden = true; await refresh(); } catch (e) { showError(e); }
 };
 async function start() {
-  try { config = await api('/api/config'); $('source').value = config.sourceDirectory; $('interval').value = config.intervalMinutes; } catch (e) { showError(e); }
+  try {
+    config = await api('/api/config'); $('source').value = config.sourceDirectory; $('interval').value = config.intervalMinutes;
+    const recovery = await api('/api/recovery');
+    $('recovery').textContent = recovery.previousShutdownWasClean ? '' : '检测到上次异常关机，恢复候选：' + (recovery.snapshot ? ('快照 #' + recovery.snapshot.id) : '暂无');
+  } catch (e) { showError(e); }
   await refresh(); await storage();
 }
 setInterval(() => { $('elapsed').textContent = currentStatus?.startedAt ? duration(Date.now() - Date.parse(currentStatus.startedAt)) : '--'; }, 1000);
