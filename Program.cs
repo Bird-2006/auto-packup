@@ -62,6 +62,12 @@ app.MapPost("/api/backups/{id:long}/restore", async (long id, RestoreRequest req
         var replaceResult = await service.ReplaceOriginalAsync(id, request.Path ?? string.Empty, ct);
         return replaceResult.Success ? Results.Ok(replaceResult) : Results.BadRequest(replaceResult);
     }
+    if (request.ReplaceSource)
+    {
+        if (!request.DatabaseStopped) return Results.BadRequest(new { error = "Confirm that every service using the source directory is stopped before a full restore." });
+        var sourceResult = await service.ReplaceSourceAsync(id, ct);
+        return sourceResult.Success ? Results.Ok(sourceResult) : Results.BadRequest(sourceResult);
+    }
     var result = await service.RestoreAsync(id, request.Destination, request.Path ?? string.Empty, ct);
     return result.Success ? Results.Ok(result) : Results.BadRequest(result);
 });

@@ -365,6 +365,48 @@ public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider
         }
     }
 
+    public async Task<RestoreResult> ReplaceSourceAsync(long id, CancellationToken ct)
+    {
+        if (!await _runLock.WaitAsync(0, ct)) return new(false, "Another operation is active.");
+        string? stage = null;
+        string? movedSource = null;
+        var timer = Stopwatch.StartNew();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        lock (_gate) { _operation = "FullRestore"; _started = DateTimeOffset.UtcNow; _currentCancel = linked; _files = 0; }
+        try
+        {
+            await ReconcileCoreAsync(linked.Token, false);
+            var run = await repo.GetRunAsync(id, linked.Token);
+            var config = await repo.GetConfigAsync(linked.Token);
+            if (run == null || run.Kind != "Vss" || run.Status != "Succeeded" || run.SourceDirectory == null) return new(false, "VSS snapshot is unavailable.");
+            var source = PathRules.LocalDirectory(config.SourceDirectory);
+            if (!string.Equals(source, PathRules.LocalDirectory(run.SourceDirectory), StringComparison.OrdinalIgnoreCase)) return new(false, "Snapshot source does not match the current configured source.");
+            var snapshotRoot = run.SnapshotPath;
+            if (!Directory.Exists(snapshotRoot)) return new(false, "Snapshot source path is inaccessible.");
+            var parent = Directory.GetParent(source)?.FullName ?? throw new IOException("Source has no parent directory.");
+            var sourceBytes = Directory.EnumerateFiles(snapshotRoot, "*", SearchOption.AllDirectories).Sum(file => new FileInfo(file).Length);
+            var drive = new DriveInfo(Path.GetPathRoot(source)!);
+            if (drive.AvailableFreeSpace < sourceBytes + 1024L * 1024 * 1024) throw new IOException($"Full restore needs about {sourceBytes / 1024 / 1024 / 1024.0:F1} GB free space, but only {drive.AvailableFreeSpace / 1024 / 1024 / 1024.0:F1} GB is available.");
+            stage = Path.Combine(parent, ".autopackup-restore-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(stage);
+            await CopyAsync(snapshotRoot, stage, linked.Token);
+            linked.Token.ThrowIfCancellationRequested();
+            movedSource = source + ".before-full-restore-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            Directory.Move(source, movedSource);
+            try { Directory.Move(stage, source); stage = null; }
+            catch { if (!Directory.Exists(source) && Directory.Exists(movedSource)) Directory.Move(movedSource, source); throw; }
+            logs.Info($"Full source restore completed from snapshot {id} in {timer.Elapsed.TotalSeconds:F1} seconds.");
+            return new(true, $"Full restore completed in {timer.Elapsed.TotalSeconds:F1} seconds. Previous source: {movedSource}", _files);
+        }
+        catch (Exception ex) { logs.Error("Full source restore failed", ex); return new(false, ex.Message, _files); }
+        finally
+        {
+            if (stage != null && Directory.Exists(stage)) try { Directory.Delete(stage, true); } catch (Exception ex) { logs.Error("Full restore staging cleanup failed", ex); }
+            lock (_gate) { _operation = null; _started = null; _currentCancel = null; }
+            _runLock.Release();
+        }
+    }
+
     private async Task CopyAsync(string source, string target, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();

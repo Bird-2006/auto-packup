@@ -13,7 +13,7 @@ public sealed record BackupConfigUpdate(string SourceDirectory, string BackupDir
 }
 public sealed record BackupRun(long Id, DateTimeOffset StartedAt, DateTimeOffset? CompletedAt, string Status, string SnapshotPath, long FileCount, long BytesCopied, long DurationMs, string? Error, string Kind = "Legacy", string? ShadowId = null, string? SourceVolume = null, string? DevicePath = null, string? SourceDirectory = null);
 public sealed record BackupStatus(bool IsRunning, bool IsQueued, DateTimeOffset? StartedAt, DateTimeOffset? NextRunAt, string? LastError, string? Operation = null, long FilesProcessed = 0);
-public sealed record RestoreRequest(string Destination, string? Path = null, bool ReplaceOriginal = false, bool DatabaseStopped = false);
+public sealed record RestoreRequest(string Destination, string? Path = null, bool ReplaceOriginal = false, bool ReplaceSource = false, bool DatabaseStopped = false);
 public sealed record RestoreResult(bool Success, string Message, long FileCount = 0);
 public sealed record FileEntry(string Name, string RelativePath, bool IsDirectory, long Size, DateTime LastWriteUtc);
 public sealed record LogEntry(DateTimeOffset Timestamp, string Level, string Message);

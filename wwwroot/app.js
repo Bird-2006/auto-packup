@@ -36,6 +36,7 @@ async function refresh() {
       const commands = document.createElement('td');
       if (run.status === 'Succeeded') {
         commands.append(button('浏览', () => openBrowser(run.id, '')), button('恢复', () => openRestore(run.id, '')));
+        if (run.kind === 'Vss') commands.append(button('全量恢复原目录', () => replaceSource(run.id)));
         commands.append(button('删除', async () => { if (confirm('删除这个快照？删除后无法恢复。')) { await api('/api/backups/' + run.id, { method: 'DELETE' }); await refresh(); } }));
       }
       if (run.error) commands.append(button('详情', () => showError(new Error(run.error))));
@@ -77,6 +78,14 @@ async function replaceOriginal(id, path) {
   if (!confirm('请先停止使用此数据库的服务。确认后当前原文件会被改名保留，再从快照替换。继续？')) return;
   try {
     const result = await api('/api/backups/' + id + '/restore', json('POST', { destination: '', path, replaceOriginal: true, databaseStopped: true }));
+    if (!result.success) throw new Error(result.message);
+    $('notice').textContent = result.message; await refresh();
+  } catch (e) { showError(e); }
+}
+async function replaceSource(id) {
+  if (!confirm('全量恢复会替换整个源目录。请先停止所有使用该目录的服务，当前目录会改名保留。继续？')) return;
+  try {
+    const result = await api('/api/backups/' + id + '/restore', json('POST', { destination: '', replaceSource: true, databaseStopped: true }));
     if (!result.success) throw new Error(result.message);
     $('notice').textContent = result.message; await refresh();
   } catch (e) { showError(e); }

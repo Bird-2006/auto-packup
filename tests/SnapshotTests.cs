@@ -51,6 +51,18 @@ public sealed class SnapshotTests : IDisposable
     }
 
     [Fact]
+    public async Task FullRestoreReplacesSourceAndKeepsPreviousDirectory()
+    {
+        await service.RunOnceAsync(default);
+        var run = (await repo.ListRunsAsync(default))[0];
+        File.WriteAllText(Path.Combine(Source, "live.txt"), "after");
+        var result = await service.ReplaceSourceAsync(run.Id, default);
+        Assert.True(result.Success, result.Message);
+        Assert.Equal("before", File.ReadAllText(Path.Combine(Source, "live.txt")));
+        Assert.Single(Directory.GetDirectories(root, "source.before-full-restore-*"));
+    }
+
+    [Fact]
     public async Task BrowsingAndRestoreRejectTraversal()
     {
         await service.RunOnceAsync(default);
@@ -106,11 +118,11 @@ public sealed class SnapshotTests : IDisposable
         var before = vss.Creations;
         await service.RunOnceAsync(default);
         Assert.Equal(2, vss.Creations - before);
-        Assert.NotEmpty((await repo.ListRunsAsync(default)).Where(x => x.Status == "Succeeded"));
+        Assert.Contains(await repo.ListRunsAsync(default), x => x.Status == "Succeeded");
         before = vss.Creations;
         await service.RunOnceAsync(default);
         Assert.Equal(1, vss.Creations - before);
-        Assert.NotEmpty((await repo.ListRunsAsync(default)).Where(x => x.Status == "Succeeded"));
+        Assert.Contains(await repo.ListRunsAsync(default), x => x.Status == "Succeeded");
     }
 
     [Fact]
