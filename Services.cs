@@ -37,6 +37,7 @@ public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider
     private string? _lastError;
     private long _files;
     private bool _previousShutdownWasClean = true;
+    private long? _recoveryCandidateId;
 
     public BackupStatus GetStatus()
     {
@@ -60,11 +61,15 @@ public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider
     {
         var previous = ReadMarker();
         _previousShutdownWasClean = previous.CleanShutdown;
+        _recoveryCandidateId = previous.RecoveryCandidateId;
         WriteMarker(new RuntimeMarker(false, previous.RecoveryCandidateId, previous.RecoveryCandidateUntil));
         try { await ReconcileAsync(ct, startup: true); }
         catch (Exception ex) { logs.Error("Startup snapshot reconciliation failed", ex); lock (_gate) _lastError = ex.Message; }
         if (!previous.CleanShutdown)
         {
+            var candidate = (await repo.ListRunsAsync(ct)).FirstOrDefault(x => x.Kind == "Vss" && x.Status == "Succeeded");
+            _recoveryCandidateId = candidate?.Id;
+            WriteMarker(new RuntimeMarker(false, _recoveryCandidateId, DateTimeOffset.UtcNow.AddHours(24)));
             lock (_gate) _queued = true;
             logs.Info("Previous service shutdown was unclean; creating a recovery snapshot immediately.");
         }
@@ -111,8 +116,10 @@ public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider
 
     public async Task<RecoveryInfo> GetRecoveryInfoAsync(CancellationToken ct)
     {
-        var snapshot = (await repo.ListRunsAsync(ct)).FirstOrDefault(x => x.Kind == "Vss" && x.Status == "Succeeded");
-        var message = snapshot == null ? "No usable VSS snapshot is available." : $"Snapshot #{snapshot.Id} is the latest recovery point.";
+        var runs = await repo.ListRunsAsync(ct);
+        var snapshot = (_recoveryCandidateId is long candidateId ? runs.FirstOrDefault(x => x.Id == candidateId && x.Status == "Succeeded") : null)
+            ?? runs.FirstOrDefault(x => x.Kind == "Vss" && x.Status == "Succeeded");
+        var message = snapshot == null ? "No usable VSS snapshot is available." : _previousShutdownWasClean ? $"Snapshot #{snapshot.Id} is the latest recovery point." : $"Snapshot #{snapshot.Id} is the recovery point from before the unexpected shutdown.";
         return new RecoveryInfo(snapshot, _previousShutdownWasClean, message);
     }
 
