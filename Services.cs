@@ -307,6 +307,7 @@ public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider
         if (string.IsNullOrWhiteSpace(relative)) return new(false, "Select a single database file to replace.");
         if (!await _runLock.WaitAsync(0, ct)) return new(false, "Another operation is active.");
         string? movedOriginal = null;
+        var movedSidecars = new List<(string Current, string Backup)>();
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
         lock (_gate) { _operation = "Replace"; _started = DateTimeOffset.UtcNow; _currentCancel = linked; _files = 0; }
         try
@@ -325,7 +326,14 @@ public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider
             foreach (var suffix in new[] { "-wal", "-shm", "-journal" })
             {
                 var sidecar = target + suffix;
-                if (File.Exists(sidecar)) File.Move(sidecar, sidecar + $".before-recovery-{stamp}");
+                var snapshotSidecar = sourceRoot + suffix;
+                if (File.Exists(sidecar))
+                {
+                    var sidecarBackup = sidecar + $".before-recovery-{stamp}";
+                    File.Move(sidecar, sidecarBackup);
+                    movedSidecars.Add((sidecar, sidecarBackup));
+                }
+                if (File.Exists(snapshotSidecar)) File.Copy(snapshotSidecar, sidecar, false);
             }
             try
             {
@@ -334,6 +342,8 @@ public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider
             catch
             {
                 if (!File.Exists(target) && File.Exists(movedOriginal)) File.Move(movedOriginal, target);
+                foreach (var (current, backup) in movedSidecars)
+                    if (!File.Exists(current) && File.Exists(backup)) File.Move(backup, current);
                 throw;
             }
             Interlocked.Increment(ref _files);
