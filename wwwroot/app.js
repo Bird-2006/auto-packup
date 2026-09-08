@@ -1,0 +1,98 @@
+const $ = id => document.getElementById(id);
+const statuses = { Succeeded: '成功', Running: '进行中', Failed: '失败', Unavailable: '已失效', Deleted: '已删除' };
+let config, currentStatus, browseId, browsePath = '', restoreId, restorePath = '', polling = false;
+const formatBytes = n => n == null ? '不限' : (n / 1073741824).toFixed(2) + ' GiB';
+const duration = ms => { const seconds = Math.max(0, Math.floor(ms / 1000)); return seconds < 60 ? (ms / 1000).toFixed(1) + ' 秒' : Math.floor(seconds / 60) + ' 分 ' + seconds % 60 + ' 秒'; };
+async function api(url, options) {
+  const response = await fetch(url, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || data.message || response.statusText);
+  return data;
+}
+const json = (method, value) => ({ method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(value) });
+function button(label, action, secondary = true) {
+  const element = document.createElement('button'); element.textContent = label;
+  if (secondary) element.className = 'secondary';
+  element.onclick = async () => { element.disabled = true; try { await action(); } catch (e) { showError(e); } finally { element.disabled = false; } };
+  return element;
+}
+function showError(error) { $('error').textContent = error.message; $('error').hidden = false; }
+async function refresh() {
+  if (polling) return;
+  polling = true;
+  try {
+    const [state, runs, logs] = await Promise.all([api('/api/status'), api('/api/backups'), api('/api/logs')]);
+    currentStatus = state;
+    $('state').textContent = state.operation === 'Restore' ? '正在恢复' : state.isRunning ? '正在创建快照' : state.isQueued ? '等待执行' : '空闲';
+    $('run').disabled = state.isRunning || state.isQueued;
+    $('cancel').disabled = !state.isRunning && !state.isQueued;
+    $('next').textContent = state.nextRunAt ? new Date(state.nextRunAt).toLocaleString() : '--';
+    $('processed').textContent = state.operation === 'Restore' ? state.filesProcessed.toLocaleString() : '--';
+    if (state.lastError) showError(new Error(state.lastError));
+    $('runs').replaceChildren(...runs.map(run => {
+      const row = document.createElement('tr');
+      const values = [new Date(run.startedAt).toLocaleString(), run.kind === 'Vss' ? 'VSS 快照' : run.snapshotPath.endsWith('.zip') ? 'ZIP 归档' : '目录归档', statuses[run.status] || run.status, run.status === 'Running' ? duration(Date.now() - Date.parse(run.startedAt)) : duration(run.durationMs), run.kind === 'Vss' ? '--' : formatBytes(run.bytesCopied)];
+      values.forEach((value, i) => { const cell = document.createElement('td'); cell.textContent = value; if (i === 2) { cell.className = run.status === 'Succeeded' ? 'good' : 'bad'; cell.title = run.error || ''; } row.append(cell); });
+      const commands = document.createElement('td');
+      if (run.status === 'Succeeded') {
+        commands.append(button('浏览', () => openBrowser(run.id, '')), button('恢复', () => openRestore(run.id, '')));
+        commands.append(button('删除', async () => { if (confirm('删除这个快照？删除后无法恢复。')) { await api('/api/backups/' + run.id, { method: 'DELETE' }); await refresh(); } }));
+      }
+      if (run.error) commands.append(button('详情', () => showError(new Error(run.error))));
+      row.append(commands); return row;
+    }));
+    $('logs').textContent = logs.map(l => '[' + new Date(l.timestamp).toLocaleString() + '] ' + l.message).join('\n');
+  } catch (e) { showError(e); } finally { polling = false; }
+}
+async function storage() {
+  try {
+    const rows = await api('/api/storage');
+    $('storage').replaceChildren(...rows.map(row => { const p = document.createElement('p'); p.textContent = row.volume + ' → ' + row.storageVolume + '　已用 ' + formatBytes(row.usedBytes) + ' / 上限 ' + formatBytes(row.maximumBytes) + '　存储卷剩余 ' + formatBytes(row.freeBytes); return p; }));
+    if (!rows.length) $('storage').textContent = '尚未分配 VSS 差异区';
+  } catch (e) { $('storage').textContent = '存储查询失败：' + e.message; }
+}
+async function openBrowser(id, path) {
+  browseId = id; browsePath = path;
+  $('browse-error').textContent = ''; $('browse-path').textContent = path || '/';
+  $('parent').disabled = !path;
+  if (!$('browser').open) $('browser').showModal();
+  try {
+    const entries = await api('/api/backups/' + id + '/files?path=' + encodeURIComponent(path));
+    $('file-list').replaceChildren(...entries.map(entry => {
+      const row = document.createElement('div'); row.className = 'file-row';
+      if (entry.isDirectory) { const name = button(entry.name + '/', () => openBrowser(id, entry.relativePath)); name.className = 'name'; row.append(name); }
+      else { const name = document.createElement('span'); name.textContent = entry.name; row.append(name); }
+      row.append(button('恢复此项', () => openRestore(id, entry.relativePath)));
+      return row;
+    }));
+    if (!entries.length) $('file-list').textContent = '空目录';
+  } catch (e) { $('file-list').replaceChildren(); $('browse-error').textContent = e.message; }
+}
+function openRestore(id, path) {
+  restoreId = id; restorePath = path; $('restore-source').textContent = '快照 #' + id + '：' + (path || '全部文件');
+  $('restore-error').textContent = ''; $('destination').value = '';
+  $('restore-dialog').showModal();
+}
+$('restore-form').onsubmit = async event => {
+  event.preventDefault(); const submit = event.submitter; submit.disabled = true;
+  try {
+    const result = await api('/api/backups/' + restoreId + '/restore', json('POST', { destination: $('destination').value, path: restorePath }));
+    if (!result.success) throw new Error(result.message);
+    $('notice').textContent = result.message; $('restore-dialog').close();
+  } catch (e) { $('restore-error').textContent = e.message; } finally { submit.disabled = false; refresh(); }
+};
+$('close-browser').onclick = () => $('browser').close();
+$('close-restore').onclick = () => $('restore-dialog').close();
+$('parent').onclick = () => openBrowser(browseId, browsePath.replaceAll('\\', '/').split('/').slice(0, -1).join('/'));
+$('run').onclick = async () => { try { await api('/api/backups/run', { method: 'POST' }); await refresh(); } catch (e) { showError(e); } };
+$('cancel').onclick = async () => { try { await api('/api/backups/cancel', { method: 'POST' }); await refresh(); } catch (e) { showError(e); } };
+$('config').onsubmit = async event => {
+  event.preventDefault(); if (!config) return;
+  try { config = await api('/api/config', json('PUT', { ...config, sourceDirectory: $('source').value, intervalMinutes: Number($('interval').value) })); $('notice').textContent = '设置已保存'; $('error').hidden = true; await refresh(); } catch (e) { showError(e); }
+};
+async function start() {
+  try { config = await api('/api/config'); $('source').value = config.sourceDirectory; $('interval').value = config.intervalMinutes; } catch (e) { showError(e); }
+  await refresh(); await storage();
+}
+setInterval(() => { $('elapsed').textContent = currentStatus?.startedAt ? duration(Date.now() - Date.parse(currentStatus.startedAt)) : '--'; }, 1000);
+setInterval(refresh, 5000); setInterval(storage, 30000); start();

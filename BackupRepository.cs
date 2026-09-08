@@ -17,6 +17,7 @@ public sealed class BackupRepository
 
     private void Initialize()
     {
+        Directory.CreateDirectory(_paths.DataDirectory);
         using var connection = new SqliteConnection(_connectionString);
         connection.Open();
         using var command = connection.CreateCommand();
@@ -34,6 +35,20 @@ public sealed class BackupRepository
             migration.ExecuteNonQuery();
         }
         catch (SqliteException ex) when (ex.SqliteErrorCode == 1 && ex.Message.Contains("duplicate column", StringComparison.OrdinalIgnoreCase)) { }
+        var columns = new HashSet<string>();
+        using (var schema = connection.CreateCommand())
+        {
+            schema.CommandText = "PRAGMA table_info(backup_runs)";
+            using var reader = schema.ExecuteReader();
+            while (reader.Read()) columns.Add(reader.GetString(1));
+        }
+        foreach (var (name, definition) in new[] { ("kind", "TEXT NOT NULL DEFAULT 'Legacy'"), ("shadow_id", "TEXT"), ("source_volume", "TEXT"), ("device_path", "TEXT"), ("source_directory", "TEXT") })
+        {
+            if (columns.Contains(name)) continue;
+            using var migration = connection.CreateCommand();
+            migration.CommandText = $"ALTER TABLE backup_runs ADD COLUMN {name} {definition}";
+            migration.ExecuteNonQuery();
+        }
     }
 
     public async Task<BackupConfig> GetConfigAsync(CancellationToken ct)
@@ -49,6 +64,8 @@ public sealed class BackupRepository
 
     public async Task<BackupConfig> UpdateConfigAsync(BackupConfigUpdate update, CancellationToken ct)
     {
+        PathRules.LocalDirectory(update.SourceDirectory);
+        PathRules.LocalDirectory(update.BackupDirectory);
         await using var connection = new SqliteConnection(_connectionString);
         await connection.OpenAsync(ct);
         await using var command = connection.CreateCommand();
@@ -83,9 +100,9 @@ public sealed class BackupRepository
     {
         var result = new List<BackupRun>();
         await using var connection = new SqliteConnection(_connectionString); await connection.OpenAsync(ct);
-        await using var command = connection.CreateCommand(); command.CommandText = "SELECT id,started_at,completed_at,status,snapshot_path,file_count,bytes_copied,duration_ms,error FROM backup_runs ORDER BY id DESC";
+        await using var command = connection.CreateCommand(); command.CommandText = "SELECT id,started_at,completed_at,status,snapshot_path,file_count,bytes_copied,duration_ms,error,kind,shadow_id,source_volume,device_path,source_directory FROM backup_runs ORDER BY id DESC";
         await using var reader = await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct)) result.Add(new BackupRun(reader.GetInt64(0), DateTimeOffset.Parse(reader.GetString(1)), reader.IsDBNull(2) ? null : DateTimeOffset.Parse(reader.GetString(2)), reader.GetString(3), reader.GetString(4), reader.GetInt64(5), reader.GetInt64(6), reader.GetInt64(7), reader.IsDBNull(8) ? null : reader.GetString(8)));
+        while (await reader.ReadAsync(ct)) result.Add(new BackupRun(reader.GetInt64(0), DateTimeOffset.Parse(reader.GetString(1)), reader.IsDBNull(2) ? null : DateTimeOffset.Parse(reader.GetString(2)), reader.GetString(3), reader.GetString(4), reader.GetInt64(5), reader.GetInt64(6), reader.GetInt64(7), reader.IsDBNull(8) ? null : reader.GetString(8), reader.GetString(9), reader.IsDBNull(10) ? null : reader.GetString(10), reader.IsDBNull(11) ? null : reader.GetString(11), reader.IsDBNull(12) ? null : reader.GetString(12), reader.IsDBNull(13) ? null : reader.GetString(13)));
         return result;
     }
 
@@ -94,14 +111,27 @@ public sealed class BackupRepository
         return (await ListRunsAsync(ct)).FirstOrDefault(x => x.Id == id);
     }
 
-    public async Task<bool> DeleteRunAsync(long id, CancellationToken ct)
+    public async Task AttachShadowAsync(long id, string source, SnapshotHandle? shadow, CancellationToken ct)
     {
-        var run = await GetRunAsync(id, ct);
-        if (run is null || run.Status != "Succeeded") return false;
-        if (Directory.Exists(run.SnapshotPath)) Directory.Delete(run.SnapshotPath, true);
         await using var connection = new SqliteConnection(_connectionString); await connection.OpenAsync(ct);
-        await using var command = connection.CreateCommand(); command.CommandText = "DELETE FROM backup_runs WHERE id=$id"; command.Parameters.AddWithValue("$id", id);
-        await command.ExecuteNonQueryAsync(ct); return true;
+        await using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE backup_runs SET kind='Vss',source_directory=$source,shadow_id=$shadow,source_volume=$volume,device_path=$device,snapshot_path=$path WHERE id=$id";
+        command.Parameters.AddWithValue("$id", id);
+        command.Parameters.AddWithValue("$source", source);
+        command.Parameters.AddWithValue("$shadow", (object?)shadow?.ShadowId ?? DBNull.Value);
+        command.Parameters.AddWithValue("$volume", (object?)shadow?.Volume ?? DBNull.Value);
+        command.Parameters.AddWithValue("$device", (object?)shadow?.DevicePath ?? DBNull.Value);
+        command.Parameters.AddWithValue("$path", shadow?.RootPath ?? string.Empty);
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
+    public async Task SetStateAsync(long id, string status, string? error, CancellationToken ct)
+    {
+        await using var connection = new SqliteConnection(_connectionString); await connection.OpenAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE backup_runs SET status=$status,error=$error WHERE id=$id";
+        command.Parameters.AddWithValue("$id", id); command.Parameters.AddWithValue("$status", status); command.Parameters.AddWithValue("$error", (object?)error ?? DBNull.Value);
+        await command.ExecuteNonQueryAsync(ct);
     }
 
     public async Task<IReadOnlyList<FileEntry>?> ListFilesAsync(long id, string relativePath, CancellationToken ct)
@@ -111,7 +141,7 @@ public sealed class BackupRepository
         {
             return await ListZipFilesAsync(run.SnapshotPath, relativePath, ct);
         }
-        var root = Path.GetFullPath(run.SnapshotPath); var current = Path.GetFullPath(Path.Combine(root, relativePath));
+        var root = Path.GetFullPath(run.Kind == "Vss" ? run.SnapshotPath : Path.Combine(run.SnapshotPath, "content")); var current = PathRules.Resolve(root, relativePath);
         if (!string.Equals(current, root, StringComparison.OrdinalIgnoreCase) && !current.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return null;
         var entries = new List<FileEntry>();
         foreach (var dir in Directory.EnumerateDirectories(current)) entries.Add(new FileEntry(Path.GetFileName(dir), Path.GetRelativePath(root, dir), true, 0, Directory.GetLastWriteTimeUtc(dir)));

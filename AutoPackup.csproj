@@ -5,10 +5,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <OutputType>Exe</OutputType>
     <Platforms>AnyCPU</Platforms>
-    <DefaultItemExcludes>$(DefaultItemExcludes);publish/**;backups/**;data/**;bin/**;obj/**</DefaultItemExcludes>
+    <DefaultItemExcludes>$(DefaultItemExcludes);publish/**;backups/**;data/**;bin/**;obj/**;tests/**;artifacts/**</DefaultItemExcludes>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.8" />
+    <PackageReference Include="System.Management" Version="8.0.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
   </ItemGroup>
 </Project>

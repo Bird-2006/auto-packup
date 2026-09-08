@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.IO.Compression;
-using System.Text.RegularExpressions;
 
 namespace AutoPackup;
 
@@ -14,209 +13,280 @@ public sealed class LogBuffer
     public void Error(string message, Exception? ex = null) => Add("Error", ex is null ? message : $"{message}: {ex.Message}");
     private void Add(string level, string message)
     {
-        _logger?.Log(level == "Error" ? LogLevel.Error : LogLevel.Information, message);
-        lock (_gate) { _entries.Add(new LogEntry(DateTimeOffset.Now, level, message)); if (_entries.Count > 500) _entries.RemoveRange(0, _entries.Count - 500); }
+        _logger?.Log(level == "Error" ? LogLevel.Error : LogLevel.Information, "{Message}", message);
+        lock (_gate) { _entries.Add(new(DateTimeOffset.Now, level, message)); if (_entries.Count > 500) _entries.RemoveAt(0); }
     }
-    public IReadOnlyList<LogEntry> Snapshot() { lock (_gate) return _entries.OrderByDescending(x => x.Timestamp).ToArray(); }
+    public IReadOnlyList<LogEntry> Snapshot() { lock (_gate) return _entries.AsEnumerable().Reverse().ToArray(); }
 }
 
-public sealed record SnapshotHandle(string RootPath, string? ShadowId);
-public interface IVolumeSnapshotProvider
+public sealed class BackupWorker(BackupService service) : BackgroundService
 {
-    Task<SnapshotHandle> CreateAsync(string sourceDirectory, CancellationToken ct);
-    Task DeleteAsync(SnapshotHandle snapshot, CancellationToken ct);
+    protected override Task ExecuteAsync(CancellationToken stoppingToken) => service.RunLoopAsync(stoppingToken);
 }
 
-public sealed class WindowsVssSnapshotProvider : IVolumeSnapshotProvider
+public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider vss, LogBuffer logs)
 {
-    private readonly LogBuffer _logs;
-    public WindowsVssSnapshotProvider(LogBuffer logs) => _logs = logs;
+    private readonly SemaphoreSlim _runLock = new(1, 1);
+    private readonly SemaphoreSlim _wake = new(0, 1);
+    private readonly object _gate = new();
+    private CancellationTokenSource? _currentCancel;
+    private bool _queued;
+    private string? _operation;
+    private DateTimeOffset? _started, _nextRun;
+    private string? _lastError;
+    private long _files;
 
-    public async Task<SnapshotHandle> CreateAsync(string sourceDirectory, CancellationToken ct)
+    public BackupStatus GetStatus()
     {
-        if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("VSS snapshots require Windows.");
-        var root = Path.GetPathRoot(Path.GetFullPath(sourceDirectory));
-        if (string.IsNullOrWhiteSpace(root)) throw new InvalidOperationException("Source directory must be on a local volume.");
-        var volume = root.TrimEnd('\\');
-        var output = await RunAsync("vssadmin", $"create shadow /for={volume}", ct);
-        var match = Regex.Match(output, @"(?i)(\\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy\d+)");
-        var idMatch = Regex.Match(output, @"(?i)\{[0-9a-f-]{36}\}");
-        if (!match.Success || !idMatch.Success) throw new InvalidOperationException($"VSS did not return a shadow volume path or id. Output: {output}");
-        var shadow = match.Groups[1].Value.TrimEnd('\\');
-        var relative = Path.GetRelativePath(root, sourceDirectory);
-        var path = Path.Combine(shadow, relative);
-        _logs.Info($"Created VSS snapshot {shadow}.");
-        return new SnapshotHandle(path, idMatch.Value);
+        lock (_gate) return new(_operation != null, _queued, _started, _nextRun, _lastError, _operation, Interlocked.Read(ref _files));
     }
 
-    public async Task DeleteAsync(SnapshotHandle snapshot, CancellationToken ct)
+    public void SignalConfigurationChanged(int intervalMinutes)
     {
-        if (string.IsNullOrWhiteSpace(snapshot.ShadowId)) return;
-        try { await RunAsync("vssadmin", $"delete shadows /shadow={snapshot.ShadowId} /quiet", ct); _logs.Info("Deleted VSS snapshot."); }
-        catch (Exception ex) { _logs.Error("Could not delete VSS snapshot", ex); }
+        lock (_gate) _nextRun = DateTimeOffset.UtcNow.AddMinutes(intervalMinutes);
+        Wake();
     }
-
-    private static async Task<string> RunAsync(string fileName, string arguments, CancellationToken ct)
+    private void Wake() { try { _wake.Release(); } catch (SemaphoreFullException) { } }
+    public bool TryQueueManualRun()
     {
-        using var process = new Process { StartInfo = new ProcessStartInfo(fileName, arguments) { UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true, CreateNoWindow = true } };
-        process.Start();
-        var stdout = await process.StandardOutput.ReadToEndAsync(ct); var stderr = await process.StandardError.ReadToEndAsync(ct);
-        await process.WaitForExitAsync(ct);
-        if (process.ExitCode != 0) throw new InvalidOperationException($"{fileName} failed ({process.ExitCode}): {stderr.Trim()} {stdout.Trim()}");
-        return stdout + Environment.NewLine + stderr;
+        lock (_gate) { if (_operation != null || _queued) return false; _queued = true; }
+        Wake(); return true;
     }
-}
+    public void CancelCurrentRun() { lock (_gate) { _queued = false; _currentCancel?.Cancel(); } }
 
-public sealed class BackupWorker : BackgroundService
-{
-    private readonly BackupService _service;
-    public BackupWorker(BackupService service) => _service = service;
-    protected override async Task ExecuteAsync(CancellationToken stoppingToken) => await _service.RunLoopAsync(stoppingToken);
-}
-
-public sealed class BackupService
-{
-    private readonly BackupRepository _repo; private readonly IVolumeSnapshotProvider _vss; private readonly LogBuffer _logs;
-    private readonly SemaphoreSlim _runLock = new(1, 1); private CancellationTokenSource? _currentCancel;
-    private readonly object _gate = new(); private bool _queued; private bool _running; private DateTimeOffset? _started; private DateTimeOffset? _nextRun; private string? _lastError; private CancellationTokenSource _configChanged = new();
-    public BackupService(BackupRepository repo, IVolumeSnapshotProvider vss, LogBuffer logs) { _repo = repo; _vss = vss; _logs = logs; }
-
-    public BackupStatus GetStatus() { lock (_gate) return new BackupStatus(_running, _queued, _started, _nextRun, _lastError); }
-    public void SignalConfigurationChanged() { lock (_gate) { _nextRun = null; _configChanged.Cancel(); _configChanged.Dispose(); _configChanged = new CancellationTokenSource(); } }
-    public bool TryQueueManualRun() { lock (_gate) { if (_running || _queued) return false; _queued = true; } _ = Task.Run(() => RunOnceAsync(CancellationToken.None)); return true; }
-    public void CancelCurrentRun() { try { _currentCancel?.Cancel(); } catch (ObjectDisposedException) { } }
-
-    public async Task RunLoopAsync(CancellationToken stoppingToken)
+    public async Task RunLoopAsync(CancellationToken ct)
     {
-        while (!stoppingToken.IsCancellationRequested)
+        await ReconcileAsync(ct, startup: true);
+        await TrimAsync(ct);
+        while (!ct.IsCancellationRequested)
         {
-            var config = await _repo.GetConfigAsync(stoppingToken);
-            DateTimeOffset due; lock (_gate) { due = _nextRun ?? DateTimeOffset.UtcNow; _nextRun = due; }
-            var delay = due - DateTimeOffset.UtcNow;
-            if (delay > TimeSpan.Zero)
+            try
             {
-                CancellationToken configToken; lock (_gate) configToken = _configChanged.Token;
-                using var linked = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken, configToken);
-                try { await Task.Delay(delay, linked.Token); } catch (OperationCanceledException) when (!stoppingToken.IsCancellationRequested) { continue; }
+                var config = await repo.GetConfigAsync(ct);
+                bool run;
+                lock (_gate)
+                {
+                    _nextRun ??= DateTimeOffset.UtcNow.AddMinutes(config.IntervalMinutes);
+                    run = _queued || DateTimeOffset.UtcNow >= _nextRun;
+                }
+                if (run) await RunOnceAsync(ct);
+                else await ReconcileAsync(ct);
+                TimeSpan delay;
+                lock (_gate) delay = _queued ? TimeSpan.Zero : (_nextRun!.Value - DateTimeOffset.UtcNow);
+                await _wake.WaitAsync(TimeSpan.FromSeconds(Math.Clamp(delay.TotalSeconds, 0.1, 30)), ct);
             }
-            await RunOnceAsync(stoppingToken);
-            config = await _repo.GetConfigAsync(stoppingToken);
-            lock (_gate) _nextRun = DateTimeOffset.UtcNow.AddMinutes(config.IntervalMinutes);
-            try { await Task.Delay(TimeSpan.FromMilliseconds(250), stoppingToken); } catch (OperationCanceledException) { }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            catch (Exception ex)
+            {
+                logs.Error("Scheduler error", ex);
+                lock (_gate) _lastError = ex.Message;
+                await Task.Delay(TimeSpan.FromSeconds(30), ct);
+            }
         }
     }
 
-    private async Task RunOnceAsync(CancellationToken stoppingToken)
+    public async Task RunOnceAsync(CancellationToken ct)
     {
-        if (!await _runLock.WaitAsync(0, stoppingToken)) { lock (_gate) _queued = false; return; }
-        var started = DateTimeOffset.UtcNow; var timer = Stopwatch.StartNew(); string? temp = null; SnapshotHandle? snapshot = null; long id = 0;
-        lock (_gate) { _running = true; _queued = false; _started = started; _lastError = null; }
-        _currentCancel = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
-        stoppingToken = _currentCancel.Token;
+        await _runLock.WaitAsync(ct);
+        var timer = Stopwatch.StartNew();
+        var started = DateTimeOffset.UtcNow;
+        long id = 0;
+        SnapshotHandle? shadow = null;
+        var committed = false;
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        lock (_gate) { _queued = false; _operation = "Snapshot"; _started = started; _lastError = null; _currentCancel = linked; _files = 0; }
         try
         {
-            var config = await _repo.GetConfigAsync(stoppingToken);
-            if (!Directory.Exists(config.SourceDirectory)) throw new DirectoryNotFoundException(config.SourceDirectory);
-            Directory.CreateDirectory(config.BackupDirectory);
-            temp = Path.Combine(config.BackupDirectory, $".tmp-{started:yyyyMMddHHmmssfff}-{Guid.NewGuid():N}.zip");
-            id = await _repo.StartRunAsync(started, temp, stoppingToken);
-            snapshot = await _vss.CreateAsync(config.SourceDirectory, stoppingToken);
-            await EnsureWorkingSpaceAsync(config.BackupDirectory, snapshot.RootPath, stoppingToken);
-            var stats = await CreateZipAsync(snapshot.RootPath, temp, stoppingToken);
-            var finalPath = Path.Combine(config.BackupDirectory, $"snapshot-{started:yyyyMMdd-HHmmss}.zip");
-            File.Move(temp, finalPath); temp = null;
-            await _repo.CompleteRunAsync(id, DateTimeOffset.UtcNow, "Succeeded", finalPath, stats.Files, stats.Bytes, timer.ElapsedMilliseconds, null, stoppingToken);
-            await TrimAsync(config.BackupDirectory, stoppingToken); _logs.Info($"Backup completed: {stats.Files} files, {stats.Bytes:N0} bytes.");
+            var config = await repo.GetConfigAsync(linked.Token);
+            var source = PathRules.LocalDirectory(config.SourceDirectory);
+            if (!Directory.Exists(source)) throw new DirectoryNotFoundException(source);
+            await ReconcileCoreAsync(linked.Token, false);
+            id = await repo.StartRunAsync(started, string.Empty, linked.Token);
+            await repo.AttachShadowAsync(id, source, null, linked.Token);
+            try { shadow = await vss.CreateAsync(source, linked.Token); }
+            catch (VssException ex) when (ex.Code is 2 or 6)
+            {
+                var owned = (await repo.ListRunsAsync(linked.Token)).Where(x => x.Kind == "Vss" && x.Status == "Succeeded" && Path.GetPathRoot(x.SourceDirectory!) == Path.GetPathRoot(source)).OrderBy(x => x.Id).ToList();
+                if (owned.Count <= 1) throw;
+                await DeleteCoreAsync(owned[0], linked.Token);
+                logs.Info("VSS storage shortage: removed oldest owned snapshot and retrying once.");
+                shadow = await vss.CreateAsync(source, linked.Token);
+            }
+            await repo.AttachShadowAsync(id, source, shadow, CancellationToken.None);
+            linked.Token.ThrowIfCancellationRequested();
+            if (!Directory.Exists(shadow.RootPath)) throw new IOException("Snapshot source path is inaccessible.");
+            await repo.CompleteRunAsync(id, DateTimeOffset.UtcNow, "Succeeded", shadow.RootPath, 0, 0, timer.ElapsedMilliseconds, null, CancellationToken.None);
+            committed = true;
+            logs.Info($"Snapshot {id} retained: {shadow.ShadowId}, {timer.Elapsed.TotalSeconds:F2} seconds.");
+            try { await TrimAsync(CancellationToken.None); }
+            catch (Exception ex) { logs.Error("Snapshot succeeded but retention cleanup failed", ex); lock (_gate) _lastError = ex.Message; }
         }
-        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { if (id != 0) await _repo.CompleteRunAsync(id, DateTimeOffset.UtcNow, "Failed", temp ?? string.Empty, 0, 0, timer.ElapsedMilliseconds, "Cancelled", CancellationToken.None); }
         catch (Exception ex)
         {
-            lock (_gate) _lastError = ex.Message; _logs.Error("Backup failed", ex);
-            if (id != 0) await _repo.CompleteRunAsync(id, DateTimeOffset.UtcNow, "Failed", temp ?? string.Empty, 0, 0, timer.ElapsedMilliseconds, ex.Message, CancellationToken.None);
+            logs.Error("Snapshot failed", ex);
+            lock (_gate) _lastError = ex is OperationCanceledException ? "Cancelled" : ex.Message;
+            if (id != 0) await repo.CompleteRunAsync(id, DateTimeOffset.UtcNow, "Failed", shadow?.RootPath ?? string.Empty, 0, 0, timer.ElapsedMilliseconds, _lastError, CancellationToken.None);
         }
         finally
         {
-            if (snapshot is not null) await _vss.DeleteAsync(snapshot, CancellationToken.None);
-            if (temp is not null && File.Exists(temp)) try { File.Delete(temp); } catch { }
-            lock (_gate) { _running = false; _started = null; }
-            _currentCancel?.Dispose(); _currentCancel = null;
+            if (!committed && shadow != null)
+            {
+                try { await vss.DeleteAsync(shadow.ShadowId, CancellationToken.None); }
+                catch (Exception ex) { logs.Error("Failed snapshot cleanup requires retry", ex); }
+            }
+            lock (_gate) { _operation = null; _started = null; _currentCancel = null; }
+            try
+            {
+                var config = await repo.GetConfigAsync(CancellationToken.None);
+                lock (_gate) if (_nextRun == null || _nextRun <= DateTimeOffset.UtcNow) _nextRun = DateTimeOffset.UtcNow.AddMinutes(config.IntervalMinutes);
+            }
+            finally { _runLock.Release(); }
+        }
+    }
+
+    public async Task ReconcileAsync(CancellationToken ct, bool startup = false)
+    {
+        await _runLock.WaitAsync(ct);
+        try { await ReconcileCoreAsync(ct, startup); }
+        finally { _runLock.Release(); }
+    }
+    private async Task ReconcileCoreAsync(CancellationToken ct, bool startup)
+    {
+        var existing = (await vss.ListAsync(ct)).ToDictionary(x => x.Id, StringComparer.OrdinalIgnoreCase);
+        foreach (var run in await repo.ListRunsAsync(ct))
+        {
+            if (startup && run.Status == "Running")
+            {
+                if (run.Kind == "Vss" && run.ShadowId != null) await vss.DeleteAsync(run.ShadowId, ct);
+                await repo.CompleteRunAsync(run.Id, DateTimeOffset.UtcNow, "Failed", run.SnapshotPath, 0, 0, 0, "Interrupted by service restart.", ct);
+            }
+            else if (run.Kind == "Vss" && run.Status == "Failed" && run.ShadowId != null && existing.ContainsKey(run.ShadowId))
+                await vss.DeleteAsync(run.ShadowId, ct);
+            else if (run.Status == "Succeeded")
+            {
+                var available = run.Kind == "Vss"
+                    ? run.ShadowId != null && existing.TryGetValue(run.ShadowId, out var found) && string.Equals(found.DevicePath, run.DevicePath, StringComparison.OrdinalIgnoreCase) && Directory.Exists(run.SnapshotPath)
+                    : File.Exists(run.SnapshotPath) || Directory.Exists(run.SnapshotPath);
+                if (!available) await repo.SetStateAsync(run.Id, "Unavailable", "Snapshot was removed or is inaccessible.", ct);
+            }
+        }
+    }
+
+    private async Task TrimAsync(CancellationToken ct)
+    {
+        var runs = (await repo.ListRunsAsync(ct)).Where(x => x.Kind == "Vss" && x.Status == "Succeeded").OrderByDescending(x => x.Id);
+        foreach (var old in runs.Skip(3)) await DeleteCoreAsync(old, ct);
+    }
+    public async Task<bool> DeleteAsync(long id, CancellationToken ct)
+    {
+        await _runLock.WaitAsync(ct);
+        try
+        {
+            var run = await repo.GetRunAsync(id, ct);
+            if (run == null || run.Status == "Running" || run.Status == "Deleted") return false;
+            await DeleteCoreAsync(run, ct); return true;
+        }
+        finally { _runLock.Release(); }
+    }
+    private async Task DeleteCoreAsync(BackupRun run, CancellationToken ct)
+    {
+        if (run.Kind == "Vss")
+        {
+            if (run.ShadowId != null) await vss.DeleteAsync(run.ShadowId, ct);
+        }
+        else
+        {
+            // Only explicitly requested legacy artifacts with an application-generated name may be deleted.
+            var path = PathRules.LocalDirectory(run.SnapshotPath);
+            if (!Path.GetFileName(path).StartsWith("snapshot-", StringComparison.Ordinal)) throw new IOException("Unrecognized legacy snapshot path.");
+            if (Directory.Exists(path)) Directory.Delete(path, true);
+            else if (File.Exists(path)) File.Delete(path);
+        }
+        await repo.SetStateAsync(run.Id, "Deleted", null, ct);
+        logs.Info($"Deleted snapshot {run.Id} ({run.Kind}).");
+    }
+
+    public async Task<RestoreResult> RestoreAsync(long id, string destination, string relative, CancellationToken ct)
+    {
+        if (!await _runLock.WaitAsync(0, ct)) return new(false, "Another operation is active.");
+        string? temp = null;
+        var timer = Stopwatch.StartNew();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        lock (_gate) { _operation = "Restore"; _started = DateTimeOffset.UtcNow; _currentCancel = linked; _files = 0; }
+        try
+        {
+            await ReconcileCoreAsync(linked.Token, false);
+            var run = await repo.GetRunAsync(id, linked.Token);
+            if (run == null || run.Status != "Succeeded") return new(false, "Snapshot is unavailable.");
+            var target = PathRules.LocalDirectory(destination);
+            if (Directory.Exists(target) || File.Exists(target)) return new(false, "Restore requires a new destination directory.");
+            var config = await repo.GetConfigAsync(linked.Token);
+            if (PathRules.Contains(config.SourceDirectory, target) || PathRules.Contains(config.BackupDirectory, target) || (run.SourceDirectory != null && PathRules.Contains(run.SourceDirectory, target)))
+                return new(false, "Restore destination cannot be inside source or backup directories.");
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            temp = target + ".restore-" + Guid.NewGuid().ToString("N");
+            Directory.CreateDirectory(temp);
+            if (run.Kind == "Vss" || Directory.Exists(run.SnapshotPath))
+            {
+                var root = run.Kind == "Vss" ? run.SnapshotPath : Path.Combine(run.SnapshotPath, "content");
+                var source = PathRules.Resolve(root, relative);
+                await CopyAsync(source, temp, linked.Token);
+            }
+            else
+            {
+                if (relative.Length != 0) return new(false, "Legacy ZIP restore requires the whole archive.");
+                using var archive = ZipFile.OpenRead(run.SnapshotPath);
+                foreach (var entry in archive.Entries)
+                {
+                    linked.Token.ThrowIfCancellationRequested();
+                    var path = PathRules.Resolve(temp, entry.FullName);
+                    if (entry.Name.Length == 0) { Directory.CreateDirectory(path); continue; }
+                    Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+                    await using (var input = entry.Open())
+                    await using (var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write))
+                        await input.CopyToAsync(output, linked.Token);
+                    Interlocked.Increment(ref _files);
+                }
+            }
+            linked.Token.ThrowIfCancellationRequested();
+            Directory.Move(temp, target); temp = null;
+            logs.Info($"Restored snapshot {id}: {_files} files in {timer.Elapsed.TotalSeconds:F1} seconds to {target}.");
+            return new(true, $"Restored {_files} files in {timer.Elapsed.TotalSeconds:F1} seconds.", _files);
+        }
+        catch (Exception ex) { logs.Error("Restore failed", ex); return new(false, ex.Message, _files); }
+        finally
+        {
+            if (temp != null) try { Directory.Delete(temp, true); } catch (Exception ex) { logs.Error("Restore temporary directory cleanup failed", ex); }
+            lock (_gate) { _operation = null; _started = null; _currentCancel = null; }
             _runLock.Release();
         }
     }
 
-    public async Task<RestoreResult> RestoreAsync(long id, string destination, CancellationToken ct)
+    private async Task CopyAsync(string source, string target, CancellationToken ct)
     {
-        var run = await _repo.GetRunAsync(id, ct); if (run is null || run.Status != "Succeeded" || (!Directory.Exists(run.SnapshotPath) && !File.Exists(run.SnapshotPath))) return new(false, "Snapshot not found.");
-        var target = Path.GetFullPath(destination); Directory.CreateDirectory(target);
-        if (File.Exists(run.SnapshotPath) && run.SnapshotPath.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+        ct.ThrowIfCancellationRequested();
+        PathRules.RejectLinks(source);
+        if (File.Exists(source))
         {
-            var stats = await ExtractZipAsync(run.SnapshotPath, target, ct); _logs.Info($"Restored compressed snapshot {id} to {target}."); return new(true, "Restore completed.", stats.Files);
+            var file = Path.Combine(target, Path.GetFileName(source));
+            await using (var input = File.OpenRead(source))
+            await using (var output = new FileStream(file, FileMode.CreateNew, FileAccess.Write))
+                await input.CopyToAsync(output, ct);
+            File.SetLastWriteTimeUtc(file, File.GetLastWriteTimeUtc(source));
+            Interlocked.Increment(ref _files);
+            return;
         }
-        var source = Path.Combine(run.SnapshotPath, "content"); var directoryStats = await CopyTreeAsync(source, target, ct); _logs.Info($"Restored snapshot {id} to {target}."); return new(true, "Restore completed.", directoryStats.Files);
-    }
-
-    private static async Task<(long Files, long Bytes)> CopyTreeAsync(string source, string destination, CancellationToken ct)
-    {
-        long files = 0, bytes = 0; Directory.CreateDirectory(destination);
-        foreach (var dir in Directory.EnumerateDirectories(source, "*", SearchOption.AllDirectories)) Directory.CreateDirectory(Path.Combine(destination, Path.GetRelativePath(source, dir)));
-        foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories)) { ct.ThrowIfCancellationRequested(); var target = Path.Combine(destination, Path.GetRelativePath(source, file)); Directory.CreateDirectory(Path.GetDirectoryName(target)!); await using var input = File.OpenRead(file); await using var output = File.Create(target); await input.CopyToAsync(output, ct); var info = new FileInfo(file); files++; bytes += info.Length; }
-        return (files, bytes);
-    }
-
-    private static async Task<(long Files, long Bytes)> CreateZipAsync(string source, string archivePath, CancellationToken ct)
-    {
-        long files = 0, bytes = 0;
-        await using var output = new FileStream(archivePath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-        using var archive = new ZipArchive(output, ZipArchiveMode.Create, leaveOpen: false);
-        foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
+        if (!Directory.Exists(source)) throw new DirectoryNotFoundException(source);
+        foreach (var entry in Directory.EnumerateFileSystemEntries(source))
         {
             ct.ThrowIfCancellationRequested();
-            var info = new FileInfo(file);
-            var entry = archive.CreateEntry(Path.GetRelativePath(source, file).Replace('\\', '/'), CompressionLevel.Fastest);
-            entry.LastWriteTime = info.LastWriteTimeUtc;
-            await using var input = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
-            await using var entryStream = entry.Open();
-            await input.CopyToAsync(entryStream, ct);
-            files++; bytes += info.Length;
+            PathRules.RejectLinks(entry);
+            if (Directory.Exists(entry))
+            {
+                var child = Path.Combine(target, Path.GetFileName(entry)); Directory.CreateDirectory(child);
+                await CopyAsync(entry, child, ct);
+            }
+            else await CopyAsync(entry, target, ct);
         }
-        return (files, bytes);
-    }
-
-    private static async Task<(long Files, long Bytes)> ExtractZipAsync(string archivePath, string destination, CancellationToken ct)
-    {
-        long files = 0, bytes = 0;
-        using var archive = ZipFile.OpenRead(archivePath);
-        var root = Path.GetFullPath(destination);
-        foreach (var entry in archive.Entries)
-        {
-            ct.ThrowIfCancellationRequested();
-            var target = Path.GetFullPath(Path.Combine(root, entry.FullName.Replace('/', Path.DirectorySeparatorChar)));
-            if (!target.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Archive contains an unsafe path.");
-            if (string.IsNullOrEmpty(entry.Name)) { Directory.CreateDirectory(target); continue; }
-            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-            await using var input = entry.Open(); await using var output = File.Create(target); await input.CopyToAsync(output, ct); files++; bytes += entry.Length;
-        }
-        return (files, bytes);
-    }
-
-    private async Task EnsureWorkingSpaceAsync(string backupDirectory, string sourcePath, CancellationToken ct)
-    {
-        var drive = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(backupDirectory))!);
-        var sourceBytes = Directory.EnumerateFiles(sourcePath, "*", SearchOption.AllDirectories).Sum(x => new FileInfo(x).Length);
-        var required = sourceBytes + 1024L * 1024 * 1024;
-        var runs = (await _repo.ListRunsAsync(ct)).Where(x => x.Status == "Succeeded" && x.SnapshotPath.StartsWith(Path.GetFullPath(backupDirectory), StringComparison.OrdinalIgnoreCase)).OrderBy(x => x.CompletedAt).ToList();
-        while (drive.AvailableFreeSpace < required && runs.Count > 0)
-        {
-            var oldest = runs[0]; runs.RemoveAt(0);
-            await _repo.DeleteRunAsync(oldest.Id, ct);
-            drive = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(backupDirectory))!);
-            _logs.Info($"Deleted oldest snapshot before compression to make room: {oldest.SnapshotPath}");
-        }
-        if (drive.AvailableFreeSpace < required) throw new IOException($"备份磁盘可用空间不足。至少需要约 {required / 1024 / 1024 / 1024.0:F1} GB，当前仅剩 {drive.AvailableFreeSpace / 1024 / 1024 / 1024.0:F1} GB。请更换备份目录或清理磁盘。");
-    }
-    private async Task TrimAsync(string backupDirectory, CancellationToken ct)
-    {
-        var runs = (await _repo.ListRunsAsync(ct)).Where(x => x.Status == "Succeeded" && x.SnapshotPath.StartsWith(Path.GetFullPath(backupDirectory), StringComparison.OrdinalIgnoreCase)).OrderByDescending(x => x.CompletedAt).ToList();
-        foreach (var old in runs.Skip(3)) { if (Directory.Exists(old.SnapshotPath)) Directory.Delete(old.SnapshotPath, true); else if (File.Exists(old.SnapshotPath)) File.Delete(old.SnapshotPath); }
     }
 }

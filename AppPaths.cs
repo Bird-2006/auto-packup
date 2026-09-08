@@ -2,7 +2,9 @@ namespace AutoPackup;
 
 public sealed class AppPaths
 {
-    public string DataDirectory { get; } = Path.Combine(AppContext.BaseDirectory, "data");
+    public AppPaths() : this(AppContext.BaseDirectory) { }
+    public AppPaths(string root) { DataDirectory = Path.Combine(root, "data"); BackupDirectory = Path.Combine(root, "backups"); }
+    public string DataDirectory { get; }
     public string DatabasePath => Path.Combine(DataDirectory, "autopackup.db");
-    public string BackupDirectory { get; } = Path.Combine(AppContext.BaseDirectory, "backups");
+    public string BackupDirectory { get; }
 }

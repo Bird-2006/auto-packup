@@ -1,27 +1,41 @@
 # Auto Packup
 
-Windows .NET 8 自动快照备份服务。默认备份 `D:\BaiduNetdiskDownload`，每 30 分钟运行一次，保留最近 3 份成功快照。管理端监听 `http://127.0.0.1:5087`。
+Windows .NET 8 backup service for `D:\BaiduNetdiskDownload`.
 
-## 构建与运行
+The default schedule is every 30 minutes. Each new backup is a persistent, crash-consistent Windows VSS snapshot. The service keeps the newest three successful VSS snapshots and releases older snapshots with their VSS IDs. It does not copy or compress the source tree during snapshot creation, so creating a backup is normally close to instantaneous and uses only VSS copy-on-write space.
 
-安装 .NET 8 SDK 后执行：
+The Web management page listens on `http://127.0.0.1:5087` and supports configuration, manual snapshots, VSS storage reporting, snapshot browsing, restore to a new directory, deletion, and logs. Existing ZIP and directory backups remain readable as legacy archives.
+
+## Build and run
+
+Install the .NET 8 SDK, then run as an administrator:
 
 ```powershell
 dotnet restore
+dotnet build -c Release
 dotnet run
 ```
 
-VSS 需要管理员权限。服务账户必须能读取源目录并写入备份目录。
+VSS requires administrator privileges. The service account must be able to read the source volume and access the configured backup data directory. VSS snapshots remain on the source volume and do not protect against source-disk failure.
 
-## 注册 Windows 服务
+## Tests
+
+```powershell
+dotnet test tests\AutoPackup.Tests.csproj -c Release
+```
+
+The test suite covers snapshot retention, restore, path traversal, restart reconciliation, deletion failures, VSS storage retry, and legacy ZIP compatibility.
+
+## Register as a Windows service
 
 ```powershell
 dotnet publish -c Release -r win-x64 --self-contained true -o publish
 sc.exe create AutoPackup binPath= "D:\auto-packup\publish\AutoPackup.exe" start= auto
+sc.exe description AutoPackup "Automatic VSS snapshot backups"
 sc.exe start AutoPackup
 ```
 
-停止/卸载：
+Stop and remove the service:
 
 ```powershell
 sc.exe stop AutoPackup
