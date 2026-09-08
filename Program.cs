@@ -5,6 +5,7 @@ builder.Host.UseWindowsService(options => options.ServiceName = "AutoPackup");
 builder.Services.AddSingleton<AppPaths>();
 builder.Services.AddSingleton<LogBuffer>();
 builder.Services.AddSingleton<BackupRepository>();
+builder.Services.AddSingleton<IArchiveCompressor, SevenZipCompressor>();
 builder.Services.AddSingleton<IVolumeSnapshotProvider, WindowsVssSnapshotProvider>();
 builder.Services.AddSingleton<BackupService>();
 builder.Services.AddHostedService<BackupWorker>();
@@ -34,6 +35,12 @@ app.MapPut("/api/config", async (BackupConfigUpdate update, BackupRepository rep
 app.MapGet("/api/status", (BackupService service) => Results.Ok(service.GetStatus()));
 app.MapGet("/api/recovery", async (BackupService service, CancellationToken ct) => Results.Ok(await service.GetRecoveryInfoAsync(ct)));
 app.MapGet("/api/storage", async (IVolumeSnapshotProvider provider, CancellationToken ct) => Results.Ok(await provider.StorageAsync(ct)));
+app.MapGet("/api/archive-storage", async (BackupRepository repo, CancellationToken ct) =>
+{
+    var config = await repo.GetConfigAsync(ct);
+    var drive = new DriveInfo(Path.GetPathRoot(config.BackupDirectory)!);
+    return Results.Ok(new { directory = config.BackupDirectory, freeBytes = drive.AvailableFreeSpace, compressionThreads = config.CompressionThreads, compressionLevel = config.CompressionLevel });
+});
 app.MapPost("/api/backups/run", async (BackupService service, CancellationToken ct) =>
 {
     var accepted = service.TryQueueManualRun();
@@ -55,7 +62,7 @@ app.MapGet("/api/backups/{id:long}/files", async (long id, string? path, BackupR
 });
 app.MapPost("/api/backups/{id:long}/restore", async (long id, RestoreRequest request, BackupService service, CancellationToken ct) =>
 {
-    if (string.IsNullOrWhiteSpace(request.Destination)) return Results.BadRequest(new { error = "Destination is required." });
+    if (!request.ReplaceOriginal && !request.ReplaceSource && string.IsNullOrWhiteSpace(request.Destination)) return Results.BadRequest(new { error = "Destination is required." });
     if (request.ReplaceOriginal)
     {
         if (!request.DatabaseStopped) return Results.BadRequest(new { error = "Confirm that the database service is stopped before replacing the original file." });

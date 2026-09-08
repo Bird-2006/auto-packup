@@ -12,3 +12,4 @@ data/
 *.suo
 artifacts/
 TestResults/
+tools/7zip/

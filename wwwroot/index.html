@@ -2,12 +2,12 @@
 <html lang="zh-CN">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Auto Packup</title><link rel="stylesheet" href="/app.css"></head>
 <body><main>
-  <header><div><h1>Auto Packup</h1><span id="state">连接中</span></div><div><button id="run">立即创建快照</button><button id="cancel" class="secondary" disabled>取消任务</button></div></header>
+  <header><div><h1>Auto Packup</h1><span id="state">连接中</span></div><div><button id="run">立即压缩备份</button><button id="cancel" class="secondary" disabled>取消任务</button></div></header>
   <p id="error" role="alert" hidden></p><p id="notice" role="status"></p><p id="recovery" role="status"></p>
-  <section class="summary"><div><span>下次创建</span><strong id="next">--</strong></div><div><span>当前耗时</span><strong id="elapsed">--</strong></div><div><span>恢复文件数</span><strong id="processed">--</strong></div><div><span>保留数量</span><strong>3 个 VSS 快照</strong></div></section>
-  <section><h2>卷存储</h2><p class="muted">差异区由整个卷共享；本机快照依赖源磁盘，无法抵御源盘损坏。</p><div id="storage"></div></section>
-  <section><h2>备份设置</h2><form id="config"><div class="settings"><label>源目录<input id="source" required></label><label>间隔（分钟）<input id="interval" type="number" min="1" max="1440" required></label><button type="submit">保存设置</button></div></form></section>
-  <section><h2>快照与历史归档</h2><div class="table-wrap"><table><thead><tr><th>开始时间</th><th>类型</th><th>状态</th><th>耗时</th><th>归档数据量</th><th>操作</th></tr></thead><tbody id="runs"></tbody></table></div></section>
+  <section class="summary"><div><span>下次备份</span><strong id="next">--</strong></div><div><span>当前耗时</span><strong id="elapsed">--</strong></div><div><span>任务进度</span><strong id="processed">--</strong><progress id="progress" max="100" value="0" hidden></progress></div><div><span>保留数量</span><strong>3 份完整 ZIP</strong></div></section>
+  <section><h2>备份存储</h2><div id="storage"></div></section>
+  <section><h2>备份设置</h2><form id="config"><div class="settings"><label>源目录<input id="source" required></label><label>备份目录<input id="backup-directory" required></label><label>间隔（分钟）<input id="interval" type="number" min="1" max="1440" required></label><label>压缩线程<input id="threads" type="number" min="1" max="16" required></label><label>压缩模式<select id="compression-level"><option value="1">速度优先</option><option value="3">平衡</option></select></label><button type="submit">保存设置</button></div><label class="check"><input id="include-crash-dumps" type="checkbox" checked>包含崩溃转储（.mdmp / .hprof）</label></form></section>
+  <section><h2>备份与历史快照</h2><div class="table-wrap"><table><thead><tr><th>开始时间</th><th>类型</th><th>状态</th><th>耗时</th><th>原始数据</th><th>压缩包</th><th>操作</th></tr></thead><tbody id="runs"></tbody></table></div></section>
   <section><h2>运行日志</h2><pre id="logs"></pre></section>
 </main>
 <dialog id="browser"><div class="dialog-head"><h2>快照文件</h2><button class="secondary" id="close-browser" title="关闭" aria-label="关闭">&#215;</button></div><div class="path-bar"><button class="secondary" id="parent" title="上一级" aria-label="上一级">&#8593;</button><span id="browse-path"></span></div><div id="file-list"></div><p id="browse-error" role="alert"></p></dialog>

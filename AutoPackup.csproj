@@ -8,6 +8,7 @@
     <DefaultItemExcludes>$(DefaultItemExcludes);publish/**;backups/**;data/**;bin/**;obj/**;tests/**;artifacts/**</DefaultItemExcludes>
   </PropertyGroup>
   <ItemGroup>
+    <Content Include="tools\7zip\**\*" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
     <PackageReference Include="Microsoft.Data.Sqlite" Version="8.0.8" />
     <PackageReference Include="System.Management" Version="8.0.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="8.0.0" />
