@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO.Compression;
+using System.Text.Json;
 
 namespace AutoPackup;
 
@@ -24,7 +25,7 @@ public sealed class BackupWorker(BackupService service) : BackgroundService
     protected override Task ExecuteAsync(CancellationToken stoppingToken) => service.RunLoopAsync(stoppingToken);
 }
 
-public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider vss, LogBuffer logs)
+public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider vss, LogBuffer logs, AppPaths paths)
 {
     private readonly SemaphoreSlim _runLock = new(1, 1);
     private readonly SemaphoreSlim _wake = new(0, 1);
@@ -56,7 +57,14 @@ public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider
 
     public async Task RunLoopAsync(CancellationToken ct)
     {
+        var previous = ReadMarker();
+        WriteMarker(new RuntimeMarker(false, previous.RecoveryCandidateId, previous.RecoveryCandidateUntil));
         await ReconcileAsync(ct, startup: true);
+        if (!previous.CleanShutdown)
+        {
+            lock (_gate) _queued = true;
+            logs.Info("Previous service shutdown was unclean; creating a recovery snapshot immediately.");
+        }
         await TrimAsync(ct);
         while (!ct.IsCancellationRequested)
         {
@@ -83,6 +91,18 @@ public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider
                 await Task.Delay(TimeSpan.FromSeconds(30), ct);
             }
         }
+        WriteMarker(new RuntimeMarker(true, null, null));
+    }
+
+    private RuntimeMarker ReadMarker()
+    {
+        try { return File.Exists(paths.RuntimeMarkerPath) ? JsonSerializer.Deserialize<RuntimeMarker>(File.ReadAllText(paths.RuntimeMarkerPath)) ?? new(true, null, null) : new(true, null, null); }
+        catch { return new(false, null, null); }
+    }
+    private void WriteMarker(RuntimeMarker marker)
+    {
+        try { Directory.CreateDirectory(paths.DataDirectory); File.WriteAllText(paths.RuntimeMarkerPath, JsonSerializer.Serialize(marker)); }
+        catch (Exception ex) { logs.Error("Could not update runtime marker", ex); }
     }
 
     public async Task RunOnceAsync(CancellationToken ct)
@@ -164,9 +184,18 @@ public sealed class BackupService(BackupRepository repo, IVolumeSnapshotProvider
                 await vss.DeleteAsync(run.ShadowId, ct);
             else if (run.Status == "Succeeded")
             {
-                var available = run.Kind == "Vss"
-                    ? run.ShadowId != null && existing.TryGetValue(run.ShadowId, out var found) && string.Equals(found.DevicePath, run.DevicePath, StringComparison.OrdinalIgnoreCase) && Directory.Exists(run.SnapshotPath)
-                    : File.Exists(run.SnapshotPath) || Directory.Exists(run.SnapshotPath);
+                var available = false;
+                ShadowInfo? found = null;
+                if (run.Kind == "Vss" && run.ShadowId != null && run.SourceDirectory != null && Path.GetPathRoot(run.SourceDirectory) != null && existing.TryGetValue(run.ShadowId, out found))
+                {
+                    var suffix = run.DevicePath != null && run.SnapshotPath.StartsWith(run.DevicePath, StringComparison.OrdinalIgnoreCase)
+                        ? run.SnapshotPath[run.DevicePath.Length..].TrimStart('\\')
+                        : Path.GetRelativePath(Path.GetPathRoot(run.SourceDirectory)!, run.SourceDirectory);
+                    var refreshed = Path.Combine(found.DevicePath + "\\", suffix);
+                    available = Directory.Exists(refreshed);
+                    if (!string.Equals(refreshed, run.SnapshotPath, StringComparison.OrdinalIgnoreCase)) await repo.UpdateShadowPathAsync(run.Id, found.DevicePath, refreshed, ct);
+                }
+                else if (run.Kind != "Vss") available = File.Exists(run.SnapshotPath) || Directory.Exists(run.SnapshotPath);
                 if (!available) await repo.SetStateAsync(run.Id, "Unavailable", "Snapshot was removed or is inaccessible.", ct);
             }
         }

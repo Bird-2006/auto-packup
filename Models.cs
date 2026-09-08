@@ -19,3 +19,4 @@ public sealed record FileEntry(string Name, string RelativePath, bool IsDirector
 public sealed record LogEntry(DateTimeOffset Timestamp, string Level, string Message);
 public sealed record ShadowInfo(string Id, string DevicePath, string Volume);
 public sealed record ShadowStorage(string Volume, string StorageVolume, ulong UsedBytes, ulong AllocatedBytes, ulong? MaximumBytes, ulong FreeBytes);
+public sealed record RuntimeMarker(bool CleanShutdown, long? RecoveryCandidateId, DateTimeOffset? RecoveryCandidateUntil);

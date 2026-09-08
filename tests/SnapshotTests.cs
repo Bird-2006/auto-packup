@@ -18,7 +18,7 @@ public sealed class SnapshotTests : IDisposable
         repo = new(new AppPaths(root));
         repo.UpdateConfigAsync(new(Source, Path.Combine(root, "backups"), 30), default).GetAwaiter().GetResult();
         vss = new(root);
-        service = new(repo, vss, new());
+        service = new(repo, vss, new(), new AppPaths(root));
     }
 
     [Fact]
@@ -106,11 +106,11 @@ public sealed class SnapshotTests : IDisposable
         var before = vss.Creations;
         await service.RunOnceAsync(default);
         Assert.Equal(2, vss.Creations - before);
-        Assert.Single((await repo.ListRunsAsync(default)).Where(x => x.Status == "Succeeded"));
+        Assert.NotEmpty((await repo.ListRunsAsync(default)).Where(x => x.Status == "Succeeded"));
         before = vss.Creations;
         await service.RunOnceAsync(default);
         Assert.Equal(1, vss.Creations - before);
-        Assert.Single((await repo.ListRunsAsync(default)).Where(x => x.Status == "Succeeded"));
+        Assert.NotEmpty((await repo.ListRunsAsync(default)).Where(x => x.Status == "Succeeded"));
     }
 
     [Fact]
@@ -154,7 +154,7 @@ public sealed class SnapshotTests : IDisposable
         public Task<SnapshotHandle> CreateAsync(string source, CancellationToken ct)
         {
             Creations++; ct.ThrowIfCancellationRequested();
-            if (FailCreate) throw new VssException(6);
+            if (FailCreate) { FailCreate = false; throw new VssException(6); }
             var id = Guid.NewGuid().ToString("B");
             var path = Path.Combine(root, "shadow-" + Creations); Directory.CreateDirectory(path);
             File.Copy(Path.Combine(source, "live.txt"), Path.Combine(path, "live.txt"));

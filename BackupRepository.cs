@@ -134,6 +134,15 @@ public sealed class BackupRepository
         await command.ExecuteNonQueryAsync(ct);
     }
 
+    public async Task UpdateShadowPathAsync(long id, string devicePath, string snapshotPath, CancellationToken ct)
+    {
+        await using var connection = new SqliteConnection(_connectionString); await connection.OpenAsync(ct);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE backup_runs SET device_path=$device,snapshot_path=$path WHERE id=$id";
+        command.Parameters.AddWithValue("$id", id); command.Parameters.AddWithValue("$device", devicePath); command.Parameters.AddWithValue("$path", snapshotPath);
+        await command.ExecuteNonQueryAsync(ct);
+    }
+
     public async Task<IReadOnlyList<FileEntry>?> ListFilesAsync(long id, string relativePath, CancellationToken ct)
     {
         var run = await GetRunAsync(id, ct); if (run is null || run.Status != "Succeeded" || (!Directory.Exists(run.SnapshotPath) && !File.Exists(run.SnapshotPath))) return null;
