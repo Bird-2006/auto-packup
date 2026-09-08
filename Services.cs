@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.IO.Compression;
 using System.Text.RegularExpressions;
 
 namespace AutoPackup;
@@ -117,13 +118,13 @@ public sealed class BackupService
             var config = await _repo.GetConfigAsync(stoppingToken);
             if (!Directory.Exists(config.SourceDirectory)) throw new DirectoryNotFoundException(config.SourceDirectory);
             Directory.CreateDirectory(config.BackupDirectory);
-            temp = Path.Combine(config.BackupDirectory, $".tmp-{started:yyyyMMddHHmmssfff}-{Guid.NewGuid():N}"); Directory.CreateDirectory(temp);
+            temp = Path.Combine(config.BackupDirectory, $".tmp-{started:yyyyMMddHHmmssfff}-{Guid.NewGuid():N}.zip");
             id = await _repo.StartRunAsync(started, temp, stoppingToken);
             snapshot = await _vss.CreateAsync(config.SourceDirectory, stoppingToken);
-            var destination = Path.Combine(temp, "content"); Directory.CreateDirectory(destination);
-            var stats = await CopyTreeAsync(snapshot.RootPath, destination, stoppingToken);
-            var finalPath = Path.Combine(config.BackupDirectory, $"snapshot-{started:yyyyMMdd-HHmmss}");
-            Directory.Move(temp, finalPath); temp = null;
+            await EnsureWorkingSpaceAsync(config.BackupDirectory, snapshot.RootPath, stoppingToken);
+            var stats = await CreateZipAsync(snapshot.RootPath, temp, stoppingToken);
+            var finalPath = Path.Combine(config.BackupDirectory, $"snapshot-{started:yyyyMMdd-HHmmss}.zip");
+            File.Move(temp, finalPath); temp = null;
             await _repo.CompleteRunAsync(id, DateTimeOffset.UtcNow, "Succeeded", finalPath, stats.Files, stats.Bytes, timer.ElapsedMilliseconds, null, stoppingToken);
             await TrimAsync(config.BackupDirectory, stoppingToken); _logs.Info($"Backup completed: {stats.Files} files, {stats.Bytes:N0} bytes.");
         }
@@ -136,7 +137,7 @@ public sealed class BackupService
         finally
         {
             if (snapshot is not null) await _vss.DeleteAsync(snapshot, CancellationToken.None);
-            if (temp is not null && Directory.Exists(temp)) try { Directory.Delete(temp, true); } catch { }
+            if (temp is not null && File.Exists(temp)) try { File.Delete(temp); } catch { }
             lock (_gate) { _running = false; _started = null; }
             _currentCancel?.Dispose(); _currentCancel = null;
             _runLock.Release();
@@ -145,9 +146,13 @@ public sealed class BackupService
 
     public async Task<RestoreResult> RestoreAsync(long id, string destination, CancellationToken ct)
     {
-        var run = await _repo.GetRunAsync(id, ct); if (run is null || run.Status != "Succeeded" || !Directory.Exists(run.SnapshotPath)) return new(false, "Snapshot not found.");
-        var source = Path.Combine(run.SnapshotPath, "content"); var target = Path.GetFullPath(destination); Directory.CreateDirectory(target);
-        var stats = await CopyTreeAsync(source, target, ct); _logs.Info($"Restored snapshot {id} to {target}."); return new(true, "Restore completed.", stats.Files);
+        var run = await _repo.GetRunAsync(id, ct); if (run is null || run.Status != "Succeeded" || (!Directory.Exists(run.SnapshotPath) && !File.Exists(run.SnapshotPath))) return new(false, "Snapshot not found.");
+        var target = Path.GetFullPath(destination); Directory.CreateDirectory(target);
+        if (File.Exists(run.SnapshotPath) && run.SnapshotPath.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+        {
+            var stats = await ExtractZipAsync(run.SnapshotPath, target, ct); _logs.Info($"Restored compressed snapshot {id} to {target}."); return new(true, "Restore completed.", stats.Files);
+        }
+        var source = Path.Combine(run.SnapshotPath, "content"); var directoryStats = await CopyTreeAsync(source, target, ct); _logs.Info($"Restored snapshot {id} to {target}."); return new(true, "Restore completed.", directoryStats.Files);
     }
 
     private static async Task<(long Files, long Bytes)> CopyTreeAsync(string source, string destination, CancellationToken ct)
@@ -157,9 +162,61 @@ public sealed class BackupService
         foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories)) { ct.ThrowIfCancellationRequested(); var target = Path.Combine(destination, Path.GetRelativePath(source, file)); Directory.CreateDirectory(Path.GetDirectoryName(target)!); await using var input = File.OpenRead(file); await using var output = File.Create(target); await input.CopyToAsync(output, ct); var info = new FileInfo(file); files++; bytes += info.Length; }
         return (files, bytes);
     }
+
+    private static async Task<(long Files, long Bytes)> CreateZipAsync(string source, string archivePath, CancellationToken ct)
+    {
+        long files = 0, bytes = 0;
+        await using var output = new FileStream(archivePath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        using var archive = new ZipArchive(output, ZipArchiveMode.Create, leaveOpen: false);
+        foreach (var file in Directory.EnumerateFiles(source, "*", SearchOption.AllDirectories))
+        {
+            ct.ThrowIfCancellationRequested();
+            var info = new FileInfo(file);
+            var entry = archive.CreateEntry(Path.GetRelativePath(source, file).Replace('\\', '/'), CompressionLevel.Fastest);
+            entry.LastWriteTime = info.LastWriteTimeUtc;
+            await using var input = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete, 1024 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            await using var entryStream = entry.Open();
+            await input.CopyToAsync(entryStream, ct);
+            files++; bytes += info.Length;
+        }
+        return (files, bytes);
+    }
+
+    private static async Task<(long Files, long Bytes)> ExtractZipAsync(string archivePath, string destination, CancellationToken ct)
+    {
+        long files = 0, bytes = 0;
+        using var archive = ZipFile.OpenRead(archivePath);
+        var root = Path.GetFullPath(destination);
+        foreach (var entry in archive.Entries)
+        {
+            ct.ThrowIfCancellationRequested();
+            var target = Path.GetFullPath(Path.Combine(root, entry.FullName.Replace('/', Path.DirectorySeparatorChar)));
+            if (!target.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) throw new InvalidDataException("Archive contains an unsafe path.");
+            if (string.IsNullOrEmpty(entry.Name)) { Directory.CreateDirectory(target); continue; }
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            await using var input = entry.Open(); await using var output = File.Create(target); await input.CopyToAsync(output, ct); files++; bytes += entry.Length;
+        }
+        return (files, bytes);
+    }
+
+    private async Task EnsureWorkingSpaceAsync(string backupDirectory, string sourcePath, CancellationToken ct)
+    {
+        var drive = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(backupDirectory))!);
+        var sourceBytes = Directory.EnumerateFiles(sourcePath, "*", SearchOption.AllDirectories).Sum(x => new FileInfo(x).Length);
+        var required = sourceBytes + 1024L * 1024 * 1024;
+        var runs = (await _repo.ListRunsAsync(ct)).Where(x => x.Status == "Succeeded" && x.SnapshotPath.StartsWith(Path.GetFullPath(backupDirectory), StringComparison.OrdinalIgnoreCase)).OrderBy(x => x.CompletedAt).ToList();
+        while (drive.AvailableFreeSpace < required && runs.Count > 0)
+        {
+            var oldest = runs[0]; runs.RemoveAt(0);
+            await _repo.DeleteRunAsync(oldest.Id, ct);
+            drive = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(backupDirectory))!);
+            _logs.Info($"Deleted oldest snapshot before compression to make room: {oldest.SnapshotPath}");
+        }
+        if (drive.AvailableFreeSpace < required) throw new IOException($"备份磁盘可用空间不足。至少需要约 {required / 1024 / 1024 / 1024.0:F1} GB，当前仅剩 {drive.AvailableFreeSpace / 1024 / 1024 / 1024.0:F1} GB。请更换备份目录或清理磁盘。");
+    }
     private async Task TrimAsync(string backupDirectory, CancellationToken ct)
     {
         var runs = (await _repo.ListRunsAsync(ct)).Where(x => x.Status == "Succeeded" && x.SnapshotPath.StartsWith(Path.GetFullPath(backupDirectory), StringComparison.OrdinalIgnoreCase)).OrderByDescending(x => x.CompletedAt).ToList();
-        foreach (var old in runs.Skip(3)) { if (Directory.Exists(old.SnapshotPath)) Directory.Delete(old.SnapshotPath, true); }
+        foreach (var old in runs.Skip(3)) { if (Directory.Exists(old.SnapshotPath)) Directory.Delete(old.SnapshotPath, true); else if (File.Exists(old.SnapshotPath)) File.Delete(old.SnapshotPath); }
     }
 }

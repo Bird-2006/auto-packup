@@ -1,4 +1,5 @@
 using Microsoft.Data.Sqlite;
+using System.IO.Compression;
 
 namespace AutoPackup;
 
@@ -105,7 +106,11 @@ public sealed class BackupRepository
 
     public async Task<IReadOnlyList<FileEntry>?> ListFilesAsync(long id, string relativePath, CancellationToken ct)
     {
-        var run = await GetRunAsync(id, ct); if (run is null || run.Status != "Succeeded" || !Directory.Exists(run.SnapshotPath)) return null;
+        var run = await GetRunAsync(id, ct); if (run is null || run.Status != "Succeeded" || (!Directory.Exists(run.SnapshotPath) && !File.Exists(run.SnapshotPath))) return null;
+        if (File.Exists(run.SnapshotPath) && run.SnapshotPath.EndsWith(".zip", StringComparison.OrdinalIgnoreCase))
+        {
+            return await ListZipFilesAsync(run.SnapshotPath, relativePath, ct);
+        }
         var root = Path.GetFullPath(run.SnapshotPath); var current = Path.GetFullPath(Path.Combine(root, relativePath));
         if (!string.Equals(current, root, StringComparison.OrdinalIgnoreCase) && !current.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return null;
         var entries = new List<FileEntry>();
@@ -113,4 +118,34 @@ public sealed class BackupRepository
         foreach (var file in Directory.EnumerateFiles(current)) { var info = new FileInfo(file); entries.Add(new FileEntry(info.Name, Path.GetRelativePath(root, file), false, info.Length, info.LastWriteTimeUtc)); }
         return entries;
     }
+
+    private static Task<IReadOnlyList<FileEntry>?> ListZipFilesAsync(string archivePath, string relativePath, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        var prefix = (relativePath ?? string.Empty).Replace('\\', '/').Trim('/');
+        if (prefix.Length > 0) prefix += "/";
+        using var archive = ZipFile.OpenRead(archivePath);
+        var entries = new List<FileEntry>();
+        var directories = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in archive.Entries)
+        {
+            var name = entry.FullName.Replace('\\', '/').TrimStart('/');
+            if (!name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)) continue;
+            var remainder = name[prefix.Length..];
+            if (remainder.Length == 0) continue;
+            var slash = remainder.IndexOf('/');
+            if (slash >= 0)
+            {
+                var directory = remainder[..slash];
+                if (directories.Add(directory)) entries.Add(new FileEntry(directory, CombineRelative(prefix, directory), true, 0, entry.LastWriteTime.UtcDateTime));
+            }
+            else if (!name.EndsWith('/'))
+            {
+                entries.Add(new FileEntry(remainder, CombineRelative(prefix, remainder), false, entry.Length, entry.LastWriteTime.UtcDateTime));
+            }
+        }
+        return Task.FromResult<IReadOnlyList<FileEntry>?>(entries);
+    }
+
+    private static string CombineRelative(string prefix, string value) => (prefix + value).Trim('/');
 }
